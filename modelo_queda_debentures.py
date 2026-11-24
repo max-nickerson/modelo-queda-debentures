@@ -27,9 +27,10 @@ ARQUIVOS = {
                           'Desde 2019, INCLUINDO debêntures que deram default, foram reestruturadas ou resgatadas. '
                           'duration_anos: da ANBIMA (se faltar, uso o prazo até o vencimento). '
                           'data_publicacao: só se o preço for publicado com atraso (ex.: marcas da CVM).'),
-    'cadastro_debentures': (True, ['codigo', 'cnpj_emissor', 'indexador', 'vencimento'], ['emissor'],
+    'cadastro_debentures': (True, ['codigo', 'cnpj_emissor', 'indexador', 'vencimento'], ['emissor', 'data_emissao', 'volume_emissao'],
                             'Uma linha por debênture (todas, inclusive vencidas). indexador: DI (CDI+ ou %CDI) ou IPCA; '
-                            'outros indexadores são ignorados.'),
+                            'outros indexadores são ignorados. data_emissao e volume_emissao (R$): opcionais, usados no '
+                            'termômetro de mercado (emissão primária fraca).'),
     'mapa_emissor_acao': (False, ['cnpj_raiz', 'ticker'], [],
                           'Emissor (8 primeiros dígitos do CNPJ) -> ação listada do PRÓPRIO emissor ou do CONTROLADOR '
                           '(ex.: SPE -> holding listada). Sem este arquivo, todas são tratadas como "sem ação".'),
@@ -268,6 +269,61 @@ def gatilho(D, P, t, diario):
     return g, motivo.str.rstrip('; ')
 
 
+# ------------------------------------------------------------------ termômetro de mercado (o "quando")
+def termometro(D, P):
+    """Fase do mercado. Validado em 2020-26: a taxa de quedas fortes que acabou de acontecer é o melhor termômetro
+    (as quedas vêm em sequência; correlação +0,49 com a taxa dos 3 meses seguintes). Amplitude (muitas DI caindo) e
+    emissão primária fraca ajudam pouco além disso (reforço). Contar alarmes (dólar, juros, Ibov...) NÃO funcionou."""
+    ult = P.m.max()
+    taxa = P.groupby('m').queda.mean().dropna()
+    recente, normal = taxa.tail(3).mean(), taxa.iloc[:-3].mean() if len(taxa) > 9 else taxa.mean()
+    px = P.set_index(['codigo', 'm']).pct_par
+    di = P[P.ix == 'DI']
+    queda_mes = (di.pct_par.values - px.reindex(list(zip(di.codigo, di.m - 1))).values) <= -0.25
+    amp = pd.Series(queda_mes, index=di.index).groupby(di.m).mean()
+    a_ult = amp.get(ult, np.nan)
+    a_alarme = a_ult >= amp[amp.index < ult].quantile(0.8) if (amp.index < ult).sum() >= 12 else False
+    linhas = [f'Termômetro do mercado ({ult}):',
+              f'  quedas fortes recentes: {recente:.1%} das debêntures (meses {taxa.index[-3]} a {taxa.index[-1]}) vs normal {normal:.1%}'
+              f'  -> {"FASE RUIM: agir sobre a lista vermelha" if recente > 1.25 * normal else "fase normal"}',
+              f'  amplitude (DI caindo >= 0,25 pt no mês): {a_ult:.0%} -> {"alarme (acima do percentil 80 histórico)" if a_alarme else "sem alarme"}']
+    cad = D['cadastro_debentures']
+    if {'data_emissao', 'volume_emissao'} <= set(cad):
+        iss = cad.dropna(subset=['data_emissao']).groupby(cad.data_emissao.dt.to_period('M')).volume_emissao.sum()
+        iss = iss.reindex(pd.period_range(iss.index.min(), ult, freq='M'), fill_value=0)
+        r = (iss.rolling(3).sum() / 3 / iss.rolling(12).mean()).dropna()
+        if len(r) > 12:
+            fraca = r.iloc[-1] <= r.iloc[:-1].quantile(0.2)
+            linhas.append(f'  emissão primária (3m vs média 12m): {r.iloc[-1]:.2f} -> {"alarme (fraca)" if fraca else "sem alarme"}')
+    print('\n'.join(linhas))
+    return linhas
+
+
+def avalia_gatilho(D, P, feats, diario):
+    """Backtest do gatilho: dentro do top 10% fora da amostra, taxa de queda quando o gatilho disparou vs não."""
+    if not diario and D.get('negocios') is None:
+        print('\nGatilho: sem dados diários (marcas diárias ou negócios) - não avaliado.')
+        return
+    P = P.copy(); P['p'] = np.nan
+    for lst, cols in feats.items():
+        for y in range(int(P.ano.min()) + 2, int(P.ano.max()) + 1):
+            tr = P[(P.com_acao == lst) & (P.m <= pd.Period(f'{y}-01', 'M') - 4) & P.queda.notna()]
+            te = (P.com_acao == lst) & (P.ano == y)
+            if tr.queda.sum() >= 20 and te.any():
+                P.loc[te, 'p'] = prob(ajusta(tr[cols].values, tr.queda.values), P.loc[te, cols].values)
+    P['pct'] = P.groupby('m').p.rank(pct=True)
+    T = P[(P.pct >= 0.9) & P.queda.notna()].copy()
+    T['gat'] = False
+    for m, idx in T.groupby('m').groups.items():
+        T.loc[idx, 'gat'] = gatilho(D, T.loc[idx], m.to_timestamp(how='end').normalize(), diario)[0].values
+    print('\nGatilho dentro do top 10% (fora da amostra), por ano: taxa de queda com gatilho / sem gatilho (n com gatilho)')
+    for y, g in T.groupby('ano'):
+        a, b = g[g.gat], g[~g.gat]
+        print(f'    {y}: {a.queda.mean():.1%} / {b.queda.mean():.1%}  (n {len(a)})' if len(a) else f'    {y}: gatilho não disparou')
+    a, b = T[T.gat], T[~T.gat]
+    print(f'  total: {a.queda.mean():.1%} com gatilho ({len(a)}) vs {b.queda.mean():.1%} sem ({len(b)})')
+
+
 # ------------------------------------------------------------------ principal
 def prepara():
     print('Lendo dados_modelo/ ...')
@@ -299,7 +355,7 @@ def backtest(P, feats):
                   f' | {int(te.queda.sum())} quedas')
 
 
-def lista(D, P, feats, diario):
+def lista(D, P, feats, diario, termo=()):
     ult = P.m.max(); t = P.t[P.m == ult].iloc[0]
     N = P[P.m == ult].copy(); N['prob'] = np.nan
     for lst, cols in feats.items():
@@ -324,6 +380,7 @@ def lista(D, P, feats, diario):
     SAIDA.mkdir(exist_ok=True)
     f = SAIDA / f'lista_risco_{ult}.csv'
     N.round(4).to_csv(f, sep=';', decimal=',', index=False, encoding='utf-8-sig')
+    (SAIDA / f'termometro_{ult}.txt').write_text('\n'.join(termo), encoding='utf-8')
     print(f'\nLista de {ult} salva em {f}  ({(N.faixa == "VERMELHO").sum()} vermelhas, {(N.faixa == "AMARELO").sum()} amarelas, '
           f'{int(N.gatilho.sum())} com gatilho)')
     print(N.head(25).to_string(index=False, float_format=lambda v: f'{v:,.2f}'))
@@ -351,4 +408,6 @@ if __name__ == '__main__':
         D, P, feats, diario = prepara()
         if a.backtest:
             backtest(P, feats)
-        lista(D, P, feats, diario)
+            avalia_gatilho(D, P, feats, diario)
+        termo = termometro(D, P)
+        lista(D, P, feats, diario, termo)

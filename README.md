@@ -41,6 +41,11 @@ AUC: 0,5 = chute, 1 = perfeito.
 
 **Faixas na saída:** VERMELHO = top 10% do mês; AMARELO = top 10–30%.
 
+**Termômetro de mercado (o "quando").** É impresso no início e salvo em `saida_modelo/termometro_AAAA-MM.txt`.
+- **Base:** a taxa de quedas fortes dos últimos 3 meses com resultado conhecido, comparada com a taxa normal. As quedas vêm em sequência: correlação de +0,49 com a taxa dos 3 meses seguintes, o melhor indicador encontrado. Acima de 1,25× o normal = "fase ruim: agir sobre a lista vermelha".
+- **Reforços fracos:** amplitude (% de debêntures DI caindo ≥ 0,25 pt de % do par no mês, acima do próprio percentil 80 histórico) e emissão primária fraca (precisa de `data_emissao`/`volume_emissao` no cadastro).
+- **Testado e reprovado:** contar alarmes de dólar, juros, Ibov abaixo da média de 200 dias e resgates. Dólar e juros subindo vieram antes de *menos* quedas em 2020–26.
+
 **Valor para a carteira** (2022–26). Marcando para revisão a fatia mais arriscada:
 
 | Fatia marcada | R$ perdido em quedas fortes que é pego |
@@ -65,7 +70,7 @@ Qualidade ano a ano, só com dados do passado (walk-forward com 4 meses de inter
 ```bash
 python modelo_queda_debentures.py
 ```
-Gera `saida_modelo/lista_risco_AAAA-MM.csv` (`;` como separador e vírgula decimal, abre direto no Excel).
+Gera `saida_modelo/lista_risco_AAAA-MM.csv` (`;` como separador e vírgula decimal, abre direto no Excel) e `saida_modelo/termometro_AAAA-MM.txt`.
 
 **Formato dos arquivos:**
 - CSV com `;` ou `,`, ou `.xlsx`.
@@ -78,7 +83,7 @@ Gera `saida_modelo/lista_risco_AAAA-MM.csv` (`;` como separador e vírgula decim
 | Arquivo | Obrigatório | Colunas | Frequência | Observações |
 |---|---|---|---|---|
 | `precos_debentures` | **sim** | `data; codigo; pct_par` (+ opc. `duration_anos; data_publicacao`) | diário (ANBIMA indicativa) ou mensal | `pct_par` = PU ÷ PU par × 100. **Desde 2019**, incluindo as debêntures que deram default, foram reestruturadas, resgatadas ou venceram. `data_publicacao` só se o preço sai com atraso (ex.: marcas da CVM) |
-| `cadastro_debentures` | **sim** | `codigo; cnpj_emissor; indexador; vencimento` (+ opc. `emissor`) | atualizar mensalmente | Uma linha por debênture, todas. `indexador` contendo "DI" (CDI+, %CDI) ou "IPCA"; os outros são ignorados |
+| `cadastro_debentures` | **sim** | `codigo; cnpj_emissor; indexador; vencimento` (+ opc. `emissor; data_emissao; volume_emissao`) | atualizar mensalmente | Uma linha por debênture, todas. `indexador` contendo "DI" (CDI+, %CDI) ou "IPCA"; os outros são ignorados. `data_emissao`/`volume_emissao` (R$) só servem para o termômetro |
 | `mapa_emissor_acao` | não, mas é o que mais pesa | `cnpj_raiz; ticker` | quando muda o controle | `cnpj_raiz` = 8 primeiros dígitos do CNPJ do emissor. Ticker do **próprio emissor ou do controlador listado** (SPE → holding, subsidiária → controladora). Pode ter mais de um ticker por emissor (faz a média) |
 | `precos_acoes` | não | `data; ticker; fechamento` | diário | Fechamento **ajustado** por dividendos e desdobramentos. Pelo menos 18 meses antes do primeiro mês analisado |
 | `fatores` | não | `data; ibov` (+ opc. `usdbrl; di5y; brent; minerio; soja; acucar; cobre`) | diário | Níveis (pontos, preço, taxa). `di5y` = taxa do DI futuro 5 anos em % a.a. Sem esse arquivo, usa o retorno bruto da ação (perde ~0,03 de AUC) |
@@ -134,14 +139,35 @@ Gera `saida_modelo/lista_risco_AAAA-MM.csv` (`;` como separador e vírgula decim
 - Grafo de grupo econômico: o grupo cai junto, sem um membro avisar antes.
 - Modelo com dezenas de variáveis ou composto de ranks com pesos iguais: pior que o modelo enxuto fora da amostra.
 
-## 8. Checagens de robustez já feitas
+## 8. Testes de ponta a ponta deste arquivo
+
+O arquivo foi rodado com dados reais convertidos para o formato da seção 4.
+
+**Teste 1: marcas mensais dos fundos na CVM, 2019–2026, sem viés de sobrevivência**, com ações, fatores, ratings, balanços e assembleias.
+
+| Ano | AUC com ação | AUC sem ação | Queda no top 10% vs geral (com ação) |
+|---|---|---|---|
+| 2022 | 0,78 | 0,77 | 5,7% vs 1,1% |
+| 2023 | 0,69 | 0,67 | 5,5% vs 2,2% |
+| 2024 | 0,86 | 0,76 | 9,2% vs 1,8% |
+| 2025 | 0,88 | 0,75 | 21,3% vs 3,2% |
+| 2026 | 0,94 | 0,70 | 24,5% vs 3,4% |
+
+As assembleias melhoram o modelo sem ação em todos os anos (+0,01 a +0,04).
+
+**Teste 2: marcas ANBIMA diárias + negócios grandes (≥ R$ 1 mi), 2024–2026.**
+- O AUC sobe para 0,94–0,97 com ação e 0,78–0,82 sem ação. Esse número é otimista: o histórico ANBIMA usado só tinha as debêntures que ainda existem (viés de sobrevivência), e o alvo e as variáveis vêm da mesma marca.
+- **O gatilho funciona em todos os anos.** Dentro do top 10% fora da amostra, a taxa de queda forte é de 24,5% com gatilho contra 12,9% sem (2024: 13,7% / 5,8%; 2025: 32,3% / 14,3%; 2026: 23,6% / 17,6%).
+- Num mês ruim o gatilho dispara para muitos nomes (333 de ~1.200 em out/26). Use-o para ordenar dentro do vermelho, não sozinho.
+
+## 9. Checagens de robustez já feitas
 
 - **Placebo:** com a ação de outro emissor sorteada no mesmo mês, o AUC cai para 0,50. O sinal é real.
 - **Não é só a marca alcançando o preço:** a ação prevê igualmente a queda medida 1 e 2 meses depois (AUC ~0,78).
 - **Sobrevivência:** as debêntures vermelhas não somem das carteiras mais que as outras.
 - **Margem de erro por ano** (IC 90%, reamostrando emissores): 2022 0,66–0,79; 2023 0,71–0,84; 2024 0,81–0,91; 2025 0,77–0,91; 2026 0,86–0,93.
 
-## 9. Estrutura do código (para adaptar)
+## 10. Estrutura do código (para adaptar)
 
 | Função | O que faz |
 |---|---|
@@ -153,11 +179,13 @@ Gera `saida_modelo/lista_risco_AAAA-MM.csv` (`;` como separador e vírgula decim
 | `ajusta()` / `prob()` / `auc()` | regressão logística em numpy e métrica |
 | `backtest()` | qualidade ano a ano, walk-forward |
 | `gatilho()` | gatilho de curto prazo com negócios e marcas diárias |
+| `avalia_gatilho()` | backtest do gatilho dentro do top 10% (roda com `--backtest`) |
+| `termometro()` | fase do mercado: quedas recentes, amplitude e emissão |
 | `lista()` | lista do último mês, com faixas, gatilho e posições |
 
 As constantes no topo do arquivo podem ser ajustadas: `QUEDA`, `FAIXAS_DURATION` e os `GATILHO_*`.
 
-## 10. Pontos em aberto ao adaptar
+## 11. Pontos em aberto ao adaptar
 
 1. Se o histórico ANBIMA não tiver as debêntures que saíram do mercado, complemente com as marcas mensais dos fundos na CVM (CDA), que têm `data_publicacao`.
 2. Se os negócios vierem em taxa, converta para % do par antes (taxa → PU pelo fluxo da escritura ÷ PU par).
